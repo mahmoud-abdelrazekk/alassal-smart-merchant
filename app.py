@@ -68,7 +68,6 @@ def derive(tables, as_of):
     p=tables["Products"].copy(); b=tables["Inventory_Batches"].copy(); si=tables["Sales_Invoice_Items"].copy()
     inv=tables["Sales_Invoices"].copy(); pay=tables["Payments_Collections"].copy()
     loc=tables["Branches_Warehouses"].copy(); cust=tables["Customers"].copy()
-    # Batch-level expiry is recalculated from the actual selected date, not the stale source field.
     b["expiry_date"] = pd.to_datetime(b["expiry_date"], errors="coerce")
     b["days_left"]=(b["expiry_date"].dt.date - as_of).apply(lambda x: x.days if pd.notna(x) else None)
     b=b.merge(p[["product_id","product_name","category","unit","unit_cost_EGP","unit_price_EGP","reorder_point_units","reorder_qty_units","primary_supplier_id"]],on="product_id",how="left")
@@ -91,7 +90,6 @@ def derive(tables, as_of):
     prod["estimated_margin_pct"] = prod.apply(lambda r: (r.estimated_gross_profit/r.sales_value_60d*100) if r.sales_value_60d>0 else 0,axis=1)
     prod["stock_value_cost"] = prod["stock_qty"]*prod["unit_cost_EGP"]
     prod["reorder_flag"]=prod["stock_qty"]<prod["reorder_point_units"]
-    # Receivables: aggregate payments by invoice before joining to invoice headers.
     paid=pay.groupby("invoice_id",as_index=False)["amount_paid_EGP"].sum().rename(columns={"amount_paid_EGP":"paid_EGP"})
     ar=inv.merge(paid,on="invoice_id",how="left").merge(cust[["customer_id","customer_name","customer_type"]],on="customer_id",how="left")
     ar["paid_EGP"]=ar["paid_EGP"].fillna(0)
@@ -99,10 +97,38 @@ def derive(tables, as_of):
     ar["due_date"]=pd.to_datetime(ar["due_date"],errors="coerce")
     ar["days_overdue"]=(pd.Timestamp(as_of)-ar["due_date"]).dt.days
     ar["is_overdue"]=(ar.balance_EGP>0)&(ar.due_date.dt.date<as_of)
-    # sales overview
     gross=si["line_gross_EGP"].sum(); net=si["line_net_EGP"].sum()
     return {"products":prod,"batches":b,"sales":sales,"recent_sales":recent,"ar":ar,"gross_sales":gross,"net_sales":net,
             "discount_value":gross-net,"anchor_date":anchor,"window_start":window_start}
+
+
+def filter_tables_by_location(tables, selected_location):
+    """Return branch-scoped tables; stock follows location_id and sales follow branch_id."""
+    scoped = {name: frame.copy() for name, frame in tables.items()}
+    if selected_location == "ALL":
+        return scoped
+
+    invoices = scoped["Sales_Invoices"]
+    invoices = invoices[invoices["branch_id"].astype(str) == str(selected_location)].copy()
+    invoice_ids = set(invoices["invoice_id"].astype(str))
+    scoped["Sales_Invoices"] = invoices
+    scoped["Sales_Invoice_Items"] = scoped["Sales_Invoice_Items"][
+        scoped["Sales_Invoice_Items"]["invoice_id"].astype(str).isin(invoice_ids)
+    ].copy()
+    scoped["Payments_Collections"] = scoped["Payments_Collections"][
+        scoped["Payments_Collections"]["invoice_id"].astype(str).isin(invoice_ids)
+    ].copy()
+    scoped["Returns"] = scoped["Returns"][
+        scoped["Returns"]["invoice_id"].astype(str).isin(invoice_ids)
+    ].copy()
+    scoped["Inventory_Batches"] = scoped["Inventory_Batches"][
+        scoped["Inventory_Batches"]["location_id"].astype(str) == str(selected_location)
+    ].copy()
+    scoped["Customers"] = scoped["Customers"][
+        scoped["Customers"]["branch_id"].astype(str) == str(selected_location)
+    ].copy()
+    return scoped
+
 
 def money(v): return f"{float(v):,.0f} ج.م"
 def pct(v): return f"{float(v):.1f}%"
@@ -143,10 +169,10 @@ def recommendation_engine(d, tables, min_margin=5.0):
             out.append({"priority":4,"type":"زيادة مخزون","product":r.product_name,"product_id":r.product_id,"evidence":f"مخزون {stock:,.0f} وحدة مقابل تغطية {cover:.0f} يومًا","action":"خفّض أو أوقف إعادة الطلب مؤقتًا وراجع توزيع الكميات بين الفروع","discount":0,"qty":stock,"status":"مراجعة","safe":safe})
     return sorted(out,key=lambda x:(x["priority"],x["product"]))
 
+
 def quantity_offer(price,cost,qty,stock,days_left,min_margin,tiers):
     """Suggest a quantity discount constrained by a gross-margin floor."""
     safe=max_safe_discount(price,cost,min_margin)
-    # Base stock/expiry pressure, then incremental quantity incentive.
     pressure=0
     if days_left is not None and days_left<=15: pressure=8
     elif days_left is not None and days_left<=30: pressure=5
@@ -158,6 +184,100 @@ def quantity_offer(price,cost,qty,stock,days_left,min_margin,tiers):
     discounted=price*(1-suggested/100)
     gross_profit=(discounted-cost)*qty
     return {"safe_cap":safe,"suggested":suggested,"unit_after":discounted,"total":discounted*qty,"gross_profit":gross_profit,"profit_per_unit":discounted-cost}
+
+
+def customer_analytics(tables, d):
+    """Explainable customer metrics; small demo data is not enough for supervised churn training."""
+    invoices = tables["Sales_Invoices"].copy()
+    customers = tables["Customers"].copy()
+    invoices["order_date"] = pd.to_datetime(invoices["order_date"], errors="coerce")
+    anchor = pd.to_datetime(d["anchor_date"]).normalize()
+    base = invoices.merge(customers[["customer_id", "customer_name", "customer_type", "region"]], on="customer_id", how="right")
+    rows = []
+    for customer_id, g in base.groupby("customer_id", dropna=False):
+        g = g.dropna(subset=["order_date"]).sort_values("order_date")
+        count = int(g["invoice_id"].nunique())
+        total = float(g["total_amount_EGP"].sum()) if not g.empty else 0.0
+        first = g["order_date"].min() if not g.empty else pd.NaT
+        last = g["order_date"].max() if not g.empty else pd.NaT
+        recency = int((anchor - last).days) if pd.notna(last) else 999
+        gaps = g["order_date"].diff().dt.days.dropna()
+        avg_gap = float(gaps.mean()) if not gaps.empty else 45.0
+        active_months = max(1.0, ((anchor - first).days / 30.4375 + 1) if pd.notna(first) else 1.0)
+        monthly_sales = total / active_months
+        expected_gap = max(30.0, avg_gap)
+        churn_score = min(100.0, max(0.0, recency / (expected_gap * 1.5) * 100))
+        if count == 0:
+            segment = "لا يوجد سجل شراء"
+        elif churn_score >= 75:
+            segment = "معرض للخمول"
+        elif count == 1 and recency <= 45:
+            segment = "عميل جديد"
+        elif monthly_sales >= 1 and count >= 3 and monthly_sales >= float(base.groupby("customer_id")["total_amount_EGP"].sum().median() if not base.empty else 0):
+            segment = "عميل ذو قيمة عالية"
+        elif count >= 3 and churn_score < 45:
+            segment = "عميل منتظم"
+        elif churn_score >= 45:
+            segment = "يحتاج متابعة"
+        else:
+            segment = "عميل نشط"
+        expected_months = max(1.0, 12.0 * (1.0 - churn_score / 100.0))
+        projected_clv = monthly_sales * expected_months
+        customer_name = customers.loc[customers.customer_id == customer_id, "customer_name"].iloc[0]
+        customer_type = customers.loc[customers.customer_id == customer_id, "customer_type"].iloc[0]
+        region = customers.loc[customers.customer_id == customer_id, "region"].iloc[0]
+        rows.append({
+            "customer_id": customer_id, "customer_name": customer_name, "customer_type": customer_type,
+            "region": region, "invoice_count": count, "historical_sales": total,
+            "monthly_sales_avg": monthly_sales, "last_purchase": last,
+            "days_since_purchase": recency, "avg_purchase_gap_days": avg_gap,
+            "churn_risk_index": churn_score, "segment": segment,
+            "estimated_active_months": expected_months, "estimated_clv": projected_clv,
+        })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return pd.DataFrame(columns=["customer_id", "customer_name", "customer_type", "region", "invoice_count", "historical_sales", "monthly_sales_avg", "last_purchase", "days_since_purchase", "avg_purchase_gap_days", "churn_risk_index", "segment", "estimated_active_months", "estimated_clv"])
+    return result.sort_values(["churn_risk_index", "historical_sales"], ascending=[False, False])
+
+
+def inventory_purchase_plan(tables, d, as_of, coverage_months, safety_pct=10):
+    """Calculate purchasing needs for the whole shop, using all customers' observed product demand."""
+    prod = tables["Products"].copy()
+    sales = d["sales"].copy()
+    batches = d["batches"].copy()
+    anchor = pd.to_datetime(d["anchor_date"]).normalize()
+    window_start = anchor - pd.Timedelta(days=59)
+    recent = sales[sales["order_date"] >= window_start]
+    demand = recent.groupby("product_id", as_index=False).agg(sold_60d=("quantity", "sum"))
+    demand["avg_monthly_demand"] = demand["sold_60d"] / 2.0
+
+    target_date = pd.Timestamp(as_of) + pd.DateOffset(months=int(coverage_months))
+    batches["expiry_date"] = pd.to_datetime(batches["expiry_date"], errors="coerce")
+    valid = batches[(batches["expiry_date"].isna()) | (batches["expiry_date"] >= target_date)]
+    usable_stock = valid.groupby("product_id")["batch_qty_units"].sum()
+    total_stock = batches.groupby("product_id")["batch_qty_units"].sum()
+    expiring_before_target = batches[
+        batches["expiry_date"].notna() & (batches["expiry_date"] < target_date) & (batches["expiry_date"] >= pd.Timestamp(as_of))
+    ].groupby("product_id")["batch_qty_units"].sum()
+
+    plan = prod.merge(demand[["product_id", "sold_60d", "avg_monthly_demand"]], on="product_id", how="left")
+    plan["sold_60d"] = plan["sold_60d"].fillna(0)
+    plan["avg_monthly_demand"] = plan["avg_monthly_demand"].fillna(0)
+    plan["valid_stock"] = plan["product_id"].map(usable_stock).fillna(0)
+    plan["current_stock"] = plan["product_id"].map(total_stock).fillna(0)
+    plan["expiring_before_horizon"] = plan["product_id"].map(expiring_before_target).fillna(0)
+    plan["forecast_need"] = plan["avg_monthly_demand"] * int(coverage_months)
+    plan["safety_stock"] = plan["forecast_need"] * (float(safety_pct) / 100.0)
+    plan["target_stock"] = (plan["forecast_need"] + plan["safety_stock"]).apply(math.ceil)
+    plan["suggested_purchase"] = (plan["target_stock"] - plan["valid_stock"]).clip(lower=0).apply(math.ceil)
+    plan["estimated_purchase_cost"] = plan["suggested_purchase"] * plan["unit_cost_EGP"]
+    supplier_names = tables["Suppliers"][["supplier_id", "supplier_name"]]
+    plan = plan.merge(supplier_names, left_on="primary_supplier_id", right_on="supplier_id", how="left")
+    plan["status"] = plan.apply(
+        lambda r: "لا توجد مبيعات حديثة" if r.avg_monthly_demand <= 0 else ("يحتاج شراء" if r.suggested_purchase > 0 else "المخزون يغطي الفترة"), axis=1
+    )
+    return plan.sort_values(["suggested_purchase", "avg_monthly_demand"], ascending=[False, False]), target_date
+
 
 # ---------------- Sidebar / data ----------------
 st.sidebar.markdown("# 🧠 Smart Merchant")
@@ -177,17 +297,26 @@ except Exception as e:
 
 with st.sidebar:
     st.markdown("---")
+    locations = tables["Branches_Warehouses"][["location_id", "location_name"]].drop_duplicates()
+    location_options = {"كل الفروع والمواقع": "ALL"}
+    location_options.update({str(r.location_name): str(r.location_id) for r in locations.itertuples()})
+    selected_location_name = st.selectbox("اختيار الفرع / الموقع", list(location_options.keys()), index=0)
+    selected_location = location_options[selected_location_name]
+    st.caption("يشمل الاختيار الفروع والمخزن الرئيسي. تتغير المبيعات حسب الفرع، والمخزون حسب موقع التخزين.")
     as_of=st.date_input("تاريخ تقييم المخزون والتنبيهات",value=date.today())
     min_margin=st.slider("أقل هامش ربح مسموح بعد الخصم",min_value=0,max_value=30,value=5,step=1,help="يستخدمه النظام كحاجز أمان عند اقتراح الخصم.")
-    page=st.radio("التنقل داخل النظام",["الرئيسية","ذكاء المخزون والصلاحية","التوصيات الذكية","العروض وخصومات الكمية","المبيعات والربحية","العملاء والتحصيل","الموردون والمرتجعات"],index=0)
+    page=st.radio("التنقل داخل النظام",["الرئيسية","ذكاء المخزون والصلاحية","التخطيط الذكي للمخزون","التوصيات الذكية","العروض وخصومات الكمية","المبيعات والربحية","العملاء والتحصيل","الموردون والمرتجعات"],index=0)
     st.markdown("---")
     st.caption("نسخة عرض تجريبية — البيانات الحالية اصطناعية وليست سجلات فعلية للشركة.")
 
+all_tables = tables
+tables = filter_tables_by_location(all_tables, selected_location)
 d=derive(tables,as_of)
 products=d["products"]; batches=d["batches"]; ar=d["ar"]
 recs=recommendation_engine(d,tables,min_margin)
 
 st.markdown(f"""<div class="hero"><h1>العسال | Smart Merchant</h1><p>من متابعة المخزون إلى قرارات بيع وشراء وتسعير أكثر ذكاءً — كل توصية مرتبطة بدليل رقمي وإجراء واضح.</p></div>""",unsafe_allow_html=True)
+st.info(f"الموقع المحدد حاليًا: **{selected_location_name}** — جميع المؤشرات المعروضة مفلترة وفق هذا الاختيار.")
 
 # ---------------- Home ----------------
 if page=="الرئيسية":
@@ -242,6 +371,42 @@ elif page=="ذكاء المخزون والصلاحية":
     inv_view["الحالة"]=inv_view.apply(lambda x:"إعادة طلب" if x.stock_qty<x.reorder_point_units else ("راكد/بطيء" if x.stock_qty>0 and (x.sold_60d==0 or x.stock_cover_days>90) else "طبيعي"),axis=1)
     inv_view=inv_view.rename(columns={"product_name":"المنتج","category":"الفئة","stock_qty":"المخزون","reorder_point_units":"حد إعادة الطلب","sold_60d":"مبيعات 60 يوم","stock_cover_days":"تغطية المخزون بالأيام","stock_value_cost":"قيمة المخزون بالتكلفة"})
     st.dataframe(inv_view.sort_values("المخزون",ascending=False),use_container_width=True,hide_index=True)
+
+
+# ---------------- Smart inventory purchasing plan ----------------
+elif page=="التخطيط الذكي للمخزون":
+    st.markdown('<div class="section-title">التخطيط الذكي للمخزون والمشتريات</div>',unsafe_allow_html=True)
+    st.write("حدد مدة التغطية المطلوبة، وسيحسب النظام احتياجات المحل من جميع العملاء اعتمادًا على حركة بيع المنتجات، ثم يخصم المخزون الصالح المتاح خلال مدة التغطية.")
+    x1, x2 = st.columns(2)
+    with x1:
+        coverage = st.slider("تغطية المخزون المطلوبة (بالشهور)", min_value=1, max_value=12, value=3, step=1)
+    with x2:
+        safety = st.slider("نسبة مخزون الأمان الإضافية", min_value=0, max_value=30, value=10, step=5, help="هامش إضافي اختياري لمواجهة زيادة الطلب.")
+    plan, target_date = inventory_purchase_plan(tables, d, as_of, coverage, safety)
+    buy = plan[plan.suggested_purchase > 0].copy()
+    total_cost = float(buy.estimated_purchase_cost.sum())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("مدة التغطية", f"{coverage} شهر")
+    k2.metric("عدد المنتجات المطلوب شراؤها", f"{len(buy):,} منتج")
+    k3.metric("إجمالي الوحدات المقترحة", f"{buy.suggested_purchase.sum():,.0f}")
+    k4.metric("تكلفة الشراء التقديرية", money(total_cost))
+    st.caption(f"تاريخ نهاية التغطية: {target_date.date()} | الطلب محسوب من آخر 60 يومًا من حركة الفواتير المسجلة حتى {pd.Timestamp(d['anchor_date']).date()}.")
+    st.markdown("### قائمة المنتجات والكميات المقترحة للشراء")
+    if not buy.empty:
+        view = buy[["product_name", "category", "unit", "avg_monthly_demand", "forecast_need", "valid_stock", "expiring_before_horizon", "suggested_purchase", "unit_cost_EGP", "estimated_purchase_cost", "supplier_name", "status"]].copy()
+        view = view.rename(columns={"product_name":"اسم المنتج", "category":"الفئة", "unit":"الوحدة", "avg_monthly_demand":"متوسط الطلب الشهري", "forecast_need":"احتياج فترة التغطية", "valid_stock":"مخزون صالح حتى نهاية الفترة", "expiring_before_horizon":"مخزون تنتهي صلاحيته قبل نهاية الفترة", "suggested_purchase":"الكمية المقترح شراؤها", "unit_cost_EGP":"تكلفة الوحدة", "estimated_purchase_cost":"تكلفة الشراء التقديرية", "supplier_name":"المورد الأساسي", "status":"الحالة"})
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            view.to_excel(writer, index=False, sheet_name="خطة المشتريات")
+        st.download_button("تحميل خطة المشتريات Excel", data=output.getvalue(), file_name="Alassal_Inventory_Purchase_Plan.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.success("المخزون الصالح الحالي يغطي الطلب المتوقع للفترة المختارة وفق البيانات المتاحة.")
+    with st.expander("عرض تحليل جميع المنتجات"):
+        all_view = plan[["product_name", "avg_monthly_demand", "forecast_need", "current_stock", "valid_stock", "expiring_before_horizon", "target_stock", "suggested_purchase", "status"]].rename(columns={"product_name":"المنتج", "avg_monthly_demand":"متوسط الطلب الشهري", "forecast_need":"الطلب المتوقع", "current_stock":"إجمالي المخزون الحالي", "valid_stock":"المخزون الصالح للفترة", "expiring_before_horizon":"كمية تنتهي قبل نهاية الفترة", "target_stock":"المخزون المستهدف", "suggested_purchase":"المطلوب شراؤه", "status":"الحالة"})
+        st.dataframe(all_view, use_container_width=True, hide_index=True)
+    st.info("ملاحظة: الحساب يعتمد على متوسط مبيعات آخر 60 يومًا. الكميات التي تنتهي صلاحيتها قبل نهاية فترة التغطية لا تُحسب ضمن المخزون القادر على تغطية الفترة. هذه خطة اقتراحية وليست أمر شراء تلقائيًا.")
+
 
 # ---------------- Recommendations ----------------
 elif page=="التوصيات الذكية":
@@ -328,19 +493,56 @@ elif page=="المبيعات والربحية":
 # ---------------- Customers ----------------
 elif page=="العملاء والتحصيل":
     st.markdown('<div class="section-title">ذكاء العملاء والتحصيل</div>',unsafe_allow_html=True)
-    overdue=ar[ar.is_overdue & (ar.balance_EGP>0)].copy().sort_values("balance_EGP",ascending=False)
-    a,b,c=st.columns(3)
-    a.metric("إجمالي الأرصدة المستحقة",money(ar.balance_EGP.sum()))
-    b.metric("أرصدة متأخرة",money(overdue.balance_EGP.sum()))
-    c.metric("عدد الفواتير المتأخرة",f"{len(overdue):,}")
-    if not overdue.empty:
-        overdue["days_overdue"]=overdue.days_overdue.fillna(0).clip(lower=0)
-        st.markdown("### العملاء والفواتير المطلوب متابعتها")
-        st.dataframe(overdue[["customer_name","invoice_id","order_date","due_date","total_amount_EGP","paid_EGP","balance_EGP","days_overdue"]].rename(columns={"customer_name":"العميل","invoice_id":"رقم الفاتورة","order_date":"تاريخ الفاتورة","due_date":"تاريخ الاستحقاق","total_amount_EGP":"قيمة الفاتورة","paid_EGP":"المدفوع","balance_EGP":"الرصيد المتبقي","days_overdue":"أيام التأخير"}),use_container_width=True,hide_index=True)
-    else: st.success("لا توجد أرصدة متأخرة وفق تاريخ التقييم.")
-    customer_ar=ar.groupby("customer_name",as_index=False).agg(invoices=("invoice_id","count"),balance=("balance_EGP","sum"),sales=("total_amount_EGP","sum")).sort_values("balance",ascending=False).head(15)
-    st.markdown("### أعلى العملاء حسب الرصيد المتبقي")
-    st.dataframe(customer_ar.rename(columns={"customer_name":"العميل","invoices":"عدد الفواتير","balance":"الرصيد المتبقي","sales":"إجمالي الفواتير"}),use_container_width=True,hide_index=True)
+    tab_ar, tab_segments, tab_value = st.tabs(["التحصيل والأرصدة", "تقسيم العملاء", "التخلي عن الشراء والقيمة الدائمة"])
+    with tab_ar:
+        overdue=ar[ar.is_overdue & (ar.balance_EGP>0)].copy().sort_values("balance_EGP",ascending=False)
+        a,b,c=st.columns(3)
+        a.metric("إجمالي الأرصدة المستحقة",money(ar.balance_EGP.sum()))
+        b.metric("أرصدة متأخرة",money(overdue.balance_EGP.sum()))
+        c.metric("عدد الفواتير المتأخرة",f"{len(overdue):,}")
+        if not overdue.empty:
+            overdue["days_overdue"]=overdue.days_overdue.fillna(0).clip(lower=0)
+            st.markdown("### العملاء والفواتير المطلوب متابعتها")
+            st.dataframe(overdue[["customer_name","invoice_id","order_date","due_date","total_amount_EGP","paid_EGP","balance_EGP","days_overdue"]].rename(columns={"customer_name":"العميل","invoice_id":"رقم الفاتورة","order_date":"تاريخ الفاتورة","due_date":"تاريخ الاستحقاق","total_amount_EGP":"قيمة الفاتورة","paid_EGP":"المدفوع","balance_EGP":"الرصيد المتبقي","days_overdue":"أيام التأخير"}),use_container_width=True,hide_index=True)
+        else: st.success("لا توجد أرصدة متأخرة وفق تاريخ التقييم.")
+        customer_ar=ar.groupby("customer_name",as_index=False).agg(invoices=("invoice_id","count"),balance=("balance_EGP","sum"),sales=("total_amount_EGP","sum")).sort_values("balance",ascending=False).head(15)
+        st.markdown("### أعلى العملاء حسب الرصيد المتبقي")
+        st.dataframe(customer_ar.rename(columns={"customer_name":"العميل","invoices":"عدد الفواتير","balance":"الرصيد المتبقي","sales":"إجمالي الفواتير"}),use_container_width=True,hide_index=True)
+
+    customer_kpis = customer_analytics(tables, d)
+    with tab_segments:
+        st.markdown("### تقسيم العملاء حسب سلوك الشراء")
+        if customer_kpis.empty:
+            st.info("لا توجد بيانات عملاء مرتبطة بهذا الموقع في ملف البيانات الحالي.")
+        seg_counts = customer_kpis.groupby("segment", as_index=False).agg(customers=("customer_id", "count"), sales=("historical_sales", "sum"))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("عدد العملاء", f"{len(customer_kpis):,}")
+        c2.metric("عملاء منتظمون", f"{int(customer_kpis.segment.eq('عميل منتظم').sum()):,}")
+        c3.metric("عملاء معرضون للخمول", f"{int(customer_kpis.segment.eq('معرض للخمول').sum()):,}")
+        st.dataframe(seg_counts.rename(columns={"segment":"الشريحة", "customers":"عدد العملاء", "sales":"إجمالي المبيعات"}), use_container_width=True, hide_index=True)
+        st.markdown("### تفاصيل كل عميل")
+        segment_view = customer_kpis[["customer_name", "customer_type", "region", "invoice_count", "historical_sales", "monthly_sales_avg", "days_since_purchase", "segment"]].rename(columns={"customer_name":"العميل", "customer_type":"نوع العميل", "region":"المنطقة", "invoice_count":"عدد الفواتير", "historical_sales":"إجمالي المبيعات التاريخية", "monthly_sales_avg":"متوسط المبيعات الشهرية", "days_since_purchase":"أيام منذ آخر شراء", "segment":"تصنيف العميل"})
+        st.dataframe(segment_view, use_container_width=True, hide_index=True)
+        st.caption("التقسيم الحالي قائم على حداثة الشراء وتكراره وقيمة مشترياته، وهو تقسيم تفسيري قابل للمراجعة وليس تصنيفًا مدربًا على بيانات موسومة.")
+
+    with tab_value:
+        st.markdown("### مؤشر احتمالية التخلي عن الشراء")
+        risk = customer_kpis.copy()
+        risk["مستوى الخطورة"] = risk.churn_risk_index.apply(lambda x: "مرتفع" if x >= 75 else ("متوسط" if x >= 45 else "منخفض"))
+        high_risk = risk[risk.churn_risk_index >= 75]
+        a, b, c, e = st.columns(4)
+        a.metric("عملاء خطورة مرتفعة", f"{len(high_risk):,}")
+        b.metric("نسبة العملاء عاليي الخطورة", pct(len(high_risk) / len(risk) * 100 if len(risk) else 0))
+        c.metric("عملاء خطورة متوسطة", f"{int(risk.churn_risk_index.between(45, 74.999).sum()):,}")
+        e.metric("متوسط مؤشر الخطورة", pct(risk.churn_risk_index.mean() if len(risk) else 0))
+        risk_view = risk[["customer_name", "days_since_purchase", "avg_purchase_gap_days", "invoice_count", "churn_risk_index", "مستوى الخطورة"]].rename(columns={"customer_name":"العميل", "days_since_purchase":"أيام منذ آخر شراء", "avg_purchase_gap_days":"متوسط الفاصل بين المشتريات (يوم)", "invoice_count":"عدد الفواتير", "churn_risk_index":"مؤشر الخطورة %"})
+        st.dataframe(risk_view, use_container_width=True, hide_index=True)
+        st.markdown("### القيمة الدائمة التقديرية للعملاء")
+        clv_total = float(customer_kpis.estimated_clv.sum())
+        st.metric("إجمالي القيمة المستقبلية التقديرية للعملاء", money(clv_total))
+        clv_view = customer_kpis.sort_values("estimated_clv", ascending=False)[["customer_name", "historical_sales", "monthly_sales_avg", "estimated_active_months", "estimated_clv", "churn_risk_index"]].rename(columns={"customer_name":"العميل", "historical_sales":"المبيعات التاريخية", "monthly_sales_avg":"متوسط المبيعات الشهرية", "estimated_active_months":"مدة استمرار متوقعة (شهر)", "estimated_clv":"القيمة الدائمة التقديرية", "churn_risk_index":"مؤشر التخلي %"})
+        st.dataframe(clv_view, use_container_width=True, hide_index=True)
+        st.caption("مهم: هذا إصدار تقديري قائم على قواعد سلوكية بسبب محدودية عدد العملاء وعدم وجود سجل تاريخي طويل وموسوم بحالات ترك الخدمة. مؤشر الخطورة ليس احتمالًا إحصائيًا معايرًا، والقيمة الدائمة سيناريو تقديري مبني على متوسط الإنفاق الشهري ومدة استمرار افتراضية تتأثر بمؤشر الخطورة؛ لا يُعرض كناتج نموذج ML موثوق قبل توافر بيانات فعلية أكثر.")
 
 # ---------------- Suppliers and returns ----------------
 elif page=="الموردون والمرتجعات":
@@ -355,6 +557,7 @@ elif page=="الموردون والمرتجعات":
     b.metric("متوسط تأخير التسليم",f"{delivered.delay_days.mean():.1f} يوم" if not delivered.empty else "—")
     c.metric("عدد المرتجعات",f"{len(tables['Returns']):,}")
     st.markdown("### مؤشرات الموردين")
+    st.caption("مؤشرات أوامر الشراء معروضة على مستوى الشركة؛ ملف البيانات الحالي لا يربط أوامر الشراء بموقع استلام محدد.")
     st.dataframe(supplier.rename(columns={"supplier_name":"المورد","orders":"عدد الطلبات","avg_delay":"متوسط الفرق عن موعد التسليم (يوم)","quality":"تقييم الجودة"}),use_container_width=True,hide_index=True)
     ret=tables["Returns"].merge(tables["Products"][["product_id","product_name"]],on="product_id",how="left")
     ret_summary=ret.groupby(["product_name","return_reason"],as_index=False).agg(return_qty=("quantity_returned","sum"),events=("return_id","count")).sort_values("return_qty",ascending=False)
